@@ -61,10 +61,12 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+    EarlyStoppingCallback
 )
 import numpy as np
 from sklearn.metrics import precision_recall_fscore_support
 import shutil
+import wandb
 
 MODEL_NAME = "answerdotai/ModernBERT-large"  # default base checkpoint
 
@@ -113,7 +115,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     # Mode
-    parser.add_argument("--mode", type=str, choices=["train", "predict"], default="train")
+    parser.add_argument("--mode", choices=["train", "predict"], default="train")
+    parser.add_argument("--wandb_project", type=str, default="ModernBERT-FT",
+                    help="If set, metrics are logged to this W&B project")
+    parser.add_argument("--run_name", type=str, default="Run-1",
+                    help="Optional wandb run name (defaults to output_dir)")
 
     args = parser.parse_args()
     args.freeze_encoder = args.freeze_encoder.lower() == "true"
@@ -264,7 +270,12 @@ def train(args):
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="eval_macro_f1",
-        logging_steps=50
+        greater_is_better=True,
+        logging_steps=50,
+        report_to=["wandb"] if args.wandb_project else [],
+        run_name=(args.run_name or os.path.basename(args.output_dir))
+                 if args.wandb_project else None,
+
     )
 
     trainer = WeightedLossTrainer(
@@ -275,10 +286,19 @@ def train(args):
         eval_dataset=val_ds,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
     trainer.train()
+
+    best_metrics = trainer.evaluate(eval_dataset=val_ds)
+    best_epoch   = trainer.state.best_step / len(train_ds) * args.batch_size
+    print(f"\n🏅  Best epoch ≈ {best_epoch:.1f}")
+    print("🔍  Best-checkpoint metrics:")
+    for k, v in best_metrics.items():
+        print(f"  {k}: {v:.4f}")
+
 
     best_ckpt = trainer.state.best_model_checkpoint
     if best_ckpt:                          # should always be non-None because
@@ -354,6 +374,11 @@ def predict(args):
 
 if __name__ == "__main__":
     _args = parse_args()
+    if _args.wandb_project is not None:
+        wandb.init(project=_args.wandb_project,
+                   name=_args.run_name or os.path.basename(_args.output_dir),
+                   config=vars(_args))
+
     if _args.mode == "train":
         train(_args)
     else:
